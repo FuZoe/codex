@@ -25,6 +25,9 @@ mod macos {
     use std::ffi::c_void;
     use std::io::Write;
     use std::io::stdout;
+    use std::sync::OnceLock;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicPtr;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
     use std::time::SystemTime;
@@ -66,16 +69,15 @@ mod macos {
     // thread that runs the CFRunLoop so no cross-thread synchronisation is
     // required beyond atomic stores/loads.
     static LAST_PRESS_MS: AtomicU64 = AtomicU64::new(0);
-    static WAITING_FOR_RELEASE: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    static WAITING_FOR_RELEASE: AtomicBool = AtomicBool::new(false);
 
-    /// Which modifier key pair to watch.
-    static mut TARGET_FLAG: CGEventFlags = 0;
+    /// Which modifier key pair to watch (set once before run-loop starts).
+    static TARGET_FLAG: OnceLock<CGEventFlags> = OnceLock::new();
     /// If `true`, fire on the first detected double-press and exit.
-    static mut IMMEDIATE: bool = false;
+    static IMMEDIATE: AtomicBool = AtomicBool::new(false);
     /// The CFMachPortRef for the event tap, stored so the callback can
     /// re-enable it if macOS disables it by timeout.
-    static mut TAP_PORT: CFMachPortRef = std::ptr::null_mut();
+    static TAP_PORT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
@@ -97,7 +99,7 @@ mod macos {
         fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
     }
 
-    // CFMachPort helpers from CoreFoundation (C API).
+    // CFMachPort / CFRunLoop helpers from CoreFoundation (C API).
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
         fn CFMachPortCreateRunLoopSource(
@@ -105,6 +107,12 @@ mod macos {
             port: CFMachPortRef,
             order: i64,
         ) -> *mut c_void;
+        fn CFRelease(cf: *const c_void);
+        fn CFRunLoopAddSource(
+            rl: core_foundation::runloop::CFRunLoopRef,
+            source: *mut c_void,
+            mode: core_foundation::string::CFStringRef,
+        );
     }
 
     fn now_ms() -> u64 {
@@ -116,10 +124,6 @@ mod macos {
 
     /// The event-tap callback.  Invoked for every `kCGEventFlagsChanged`
     /// event and for tap-disabled notifications.
-    ///
-    /// SAFETY: called from the CFRunLoop on the main thread; the globals it
-    /// touches (`TARGET_FLAG`, `IMMEDIATE`, `TAP_PORT`) are only written
-    /// before the run-loop starts and read here.
     unsafe extern "C" fn tap_callback(
         _proxy: CGEventTapProxy,
         event_type: CGEventType,
@@ -128,10 +132,9 @@ mod macos {
     ) -> CGEventRef {
         // macOS may disable the tap after a timeout.  Re-enable it.
         if event_type == K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT {
-            unsafe {
-                if !TAP_PORT.is_null() {
-                    CGEventTapEnable(TAP_PORT, true);
-                }
+            let port = TAP_PORT.load(Ordering::Relaxed);
+            if !port.is_null() {
+                unsafe { CGEventTapEnable(port, true) };
             }
             return event;
         }
@@ -141,7 +144,7 @@ mod macos {
         }
 
         let flags = unsafe { CGEventGetFlags(event) } & MODIFIER_FLAGS_MASK;
-        let target = unsafe { TARGET_FLAG };
+        let target = *TARGET_FLAG.get().unwrap_or(&0);
 
         let target_pressed = (flags & target) == target;
         // Make sure *only* our target modifier is held (no other modifiers).
@@ -163,7 +166,7 @@ mod macos {
                 let _ = stdout().flush();
                 LAST_PRESS_MS.store(0, Ordering::Relaxed);
 
-                if unsafe { IMMEDIATE } {
+                if IMMEDIATE.load(Ordering::Relaxed) {
                     std::process::exit(0);
                 }
             } else {
@@ -172,6 +175,12 @@ mod macos {
             WAITING_FOR_RELEASE.store(true, Ordering::Relaxed);
         } else {
             // Modifier released (or a different modifier is now held).
+            // Clear the first-press timestamp when a *different* modifier is
+            // pressed so that target → other → target within 400ms is not
+            // mis-detected as a double-press of target.
+            if flags != 0 {
+                LAST_PRESS_MS.store(0, Ordering::Relaxed);
+            }
             WAITING_FOR_RELEASE.store(false, Ordering::Relaxed);
         }
 
@@ -218,12 +227,10 @@ mod macos {
             }
         };
 
-        // SAFETY: these globals are written once before the run-loop starts
-        // and only read from the callback afterwards.
-        unsafe {
-            TARGET_FLAG = target_flag;
-            IMMEDIATE = immediate;
-        }
+        TARGET_FLAG
+            .set(target_flag)
+            .expect("TARGET_FLAG already set");
+        IMMEDIATE.store(immediate, Ordering::Relaxed);
 
         let event_mask: CGEventMask = 1 << K_CG_EVENT_FLAGS_CHANGED;
 
@@ -245,30 +252,23 @@ mod macos {
             std::process::exit(1);
         }
 
-        unsafe {
-            TAP_PORT = tap;
-        }
+        TAP_PORT.store(tap, Ordering::Relaxed);
 
         let source = unsafe {
             CFMachPortCreateRunLoopSource(std::ptr::null(), tap, /*order*/ 0)
         };
         if source.is_null() {
+            // Clean up the tap before exiting.
+            unsafe { CFRelease(tap) };
             eprintln!("failed to create run-loop source from event tap");
             std::process::exit(1);
         }
 
         unsafe {
             let rl = CFRunLoop::get_current();
-            // `CFRunLoopAddSource` is not wrapped by the `core-foundation`
-            // crate, so call through the raw C API.
-            extern "C" {
-                fn CFRunLoopAddSource(
-                    rl: core_foundation::runloop::CFRunLoopRef,
-                    source: *mut c_void,
-                    mode: core_foundation::string::CFStringRef,
-                );
-            }
             CFRunLoopAddSource(rl.as_concrete_TypeRef(), source, kCFRunLoopCommonModes);
+            // Release our ownership of the source (the run-loop retains it).
+            CFRelease(source);
         }
 
         // Signal readiness.
@@ -276,6 +276,8 @@ mod macos {
         let _ = stdout().flush();
 
         // Run the event loop forever (or until `--immediate` triggers exit).
+        // Note: `tap` is intentionally not released here – it must remain
+        // alive for the duration of the process.  On exit the OS reclaims it.
         CFRunLoop::run_current();
     }
 }

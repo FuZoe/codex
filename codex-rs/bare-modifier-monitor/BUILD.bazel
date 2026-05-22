@@ -1,0 +1,6 @@
+load("//:defs.bzl", "codex_rust_crate")
+
+codex_rust_crate(
+    name = "bare-modifier-monitor",
+    crate_name = "codex_bare_modifier_monitor",
+)
