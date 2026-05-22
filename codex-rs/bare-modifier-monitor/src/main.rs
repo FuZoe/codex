@@ -115,13 +115,6 @@ mod macos {
         );
     }
 
-    fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
-    }
-
     /// The event-tap callback.  Invoked for every `kCGEventFlagsChanged`
     /// event and for tap-disabled notifications.
     unsafe extern "C" fn tap_callback(
@@ -134,7 +127,9 @@ mod macos {
         if event_type == K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT {
             let port = TAP_PORT.load(Ordering::Relaxed);
             if !port.is_null() {
-                unsafe { CGEventTapEnable(port, /*enable*/ true) };
+                unsafe {
+                    CGEventTapEnable(port, /*enable*/ true)
+                };
             }
             return event;
         }
@@ -144,7 +139,7 @@ mod macos {
         }
 
         let flags = unsafe { CGEventGetFlags(event) } & MODIFIER_FLAGS_MASK;
-        let target = *TARGET_FLAG.get().unwrap_or(&0);
+        let target = *TARGET_FLAG.get().expect("TARGET_FLAG not set");
 
         let target_pressed = (flags & target) == target;
         // Make sure *only* our target modifier is held (no other modifiers).
@@ -156,7 +151,10 @@ mod macos {
                 return event;
             }
 
-            let now = now_ms();
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
             let prev = LAST_PRESS_MS.load(Ordering::Relaxed);
             let delta = now.saturating_sub(prev);
 
