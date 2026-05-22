@@ -134,7 +134,7 @@ mod macos {
         if event_type == K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT {
             let port = TAP_PORT.load(Ordering::Relaxed);
             if !port.is_null() {
-                unsafe { CGEventTapEnable(port, true) };
+                unsafe { CGEventTapEnable(port, /*enable*/ true) };
             }
             return event;
         }
