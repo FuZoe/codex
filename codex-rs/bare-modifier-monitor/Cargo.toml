@@ -1,0 +1,15 @@
+[package]
+name = "codex-bare-modifier-monitor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bare-modifier-monitor"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9"
